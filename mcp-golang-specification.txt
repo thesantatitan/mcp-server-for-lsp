@@ -1,0 +1,998 @@
+# Architecture
+
+mcp-golang library architecture
+
+The library is split functionally into three distinct components which mimic the architecture of the MCP protocol itself:
+
+*   **The transport layer** - which handles the actual communication between the client. This could be a TCP connection, an HTTP request, or a WebSocket connection or anything else.
+    It is reponsible for taking those underlying messages and converting them to JSON-RPC messages and taking JSON-RPC messages and converting them to underlying messages.
+*   **The protocol layer** - which defines the actual protocol for the transport layer, it takes JSON-RPC messages and turns them into requests, notifications, and responses.
+    It also has a list of handlers which handle requests and notifications, it performs the JSON-RPC method routing and error handling.
+*   **The server layer** - which is the actual implementation of the server, it takes the protocol layer and the transport layer and builds a server that can handle requests from clients.
+    It offers a much higher level API to the user where they can register basic handlers for tools, resources, prompts, completions, etc.
+*   **The user code** itself, which are handlers. These handlers implement the business logic for the tools, resources, prompts, completions, etc and are passed to the server layer.
+
+<img src="https://mintlify.s3.us-west-1.amazonaws.com/mcp-golang/images/protocol-diagram.svg" alt="MCP Golang architecture diagram" />
+
+
+# Change Notifications
+
+How change notifications are handled in mcp-golang
+
+The Model Context Protocol allows clients to get notified when a resource has changed.
+This allows clients to do things like refresh the LLMs context when an underlying resource has changed.
+Lets say you have some application logs in a resource, the server could periodically refresh the application log resource to allow the client to get latest logs.
+
+## Implementation
+
+In mcp-golang, the server will send a notification to the client when any of the following events occur:
+
+*   A new tool is registered via the `RegisterTool` function
+*   A new prompt is registered via the `RegisterPrompt` function
+*   A new resource is registered via the `RegisterResource` function
+*   A prompt is deregistered via the `DeregisterPrompt` function
+*   A tool is deregistered via the `DeregisterTool` function
+*   A resource is deregistered via the `DeregisterResource` function
+
+A silly e2e example of this is the server below. It registers and deregisters a tool, prompt, and resource every second causing 3 notifications to be sent to the client each second.
+
+```go
+package main
+
+import (
+	"fmt"
+	mcp_golang "github.com/metoro-io/mcp-golang"
+	"github.com/metoro-io/mcp-golang/transport/stdio"
+	"time"
+)
+
+type HelloArguments struct {
+	Submitter string `json:"submitter" jsonschema:"required,description=The name of the thing calling this tool (openai or google or claude etc)'"`
+}
+
+type Content struct {
+	Title       string  `json:"title" jsonschema:"required,description=The title to submit"`
+	Description *string `json:"description" jsonschema:"description=The description to submit"`
+}
+
+func main() {
+	done := make(chan struct{})
+	server := mcp_golang.NewServer(stdio.NewStdioServerTransport())
+	err := server.Serve()
+	if err != nil {
+		panic(err)
+	}
+	go func() {
+		for {
+			err := server.RegisterTool("hello", "Say hello to a person", func(arguments HelloArguments) (*mcp_golang.ToolResponse, error) {
+				return mcp_golang.NewToolResponse(mcp_golang.NewTextContent(fmt.Sprintf("Hello, %s!", arguments.Submitter))), nil
+			})
+			if err != nil {
+				panic(err)
+			}
+			time.Sleep(1 * time.Second)
+			err = server.DeregisterTool("hello")
+			if err != nil {
+				panic(err)
+			}
+		}
+	}()
+	go func() {
+		for {
+
+			err = server.RegisterPrompt("prompt_test", "This is a test prompt", func(arguments Content) (*mcp_golang.PromptResponse, error) {
+				return mcp_golang.NewPromptResponse("description", mcp_golang.NewPromptMessage(mcp_golang.NewTextContent(fmt.Sprintf("Hello, %server!", arguments.Title)), mcp_golang.RoleUser)), nil
+			})
+			if err != nil {
+				panic(err)
+			}
+			time.Sleep(1 * time.Second)
+			err = server.DeregisterPrompt("prompt_test")
+			if err != nil {
+				panic(err)
+			}
+		}
+
+	}()
+	go func() {
+		err = server.RegisterResource("test://resource", "resource_test", "This is a test resource", "application/json", func() (*mcp_golang.ResourceResponse, error) {
+			return mcp_golang.NewResourceResponse(mcp_golang.NewTextEmbeddedResource("test://resource", "This is a test resource", "application/json")), nil
+		})
+		if err != nil {
+			panic(err)
+		}
+		time.Sleep(1 * time.Second)
+		err = server.DeregisterResource("test://resource")
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	<-done
+}
+```
+
+
+# Using the MCP Client
+
+Learn how to use the MCP client to interact with MCP servers
+
+# MCP Client Usage Guide
+
+The MCP client provides a simple and intuitive way to interact with MCP servers. This guide will walk you through initializing the client, connecting to a server, and using various MCP features.
+
+## Installation
+
+Add the MCP Golang package to your project:
+
+```bash
+go get github.com/metoro-io/mcp-golang
+```
+
+## Basic Usage
+
+Here's a simple example of creating and initializing an MCP client:
+
+```go
+import (
+    mcp "github.com/metoro-io/mcp-golang"
+    "github.com/metoro-io/mcp-golang/transport/stdio"
+)
+
+// Create a transport (stdio in this example)
+transport := stdio.NewStdioServerTransportWithIO(stdout, stdin)
+
+// Create a new client
+client := mcp.NewClient(transport)
+
+// Initialize the client
+response, err := client.Initialize(context.Background())
+if err != nil {
+    log.Fatalf("Failed to initialize client: %v", err)
+}
+```
+
+## Working with Tools
+
+### Listing Available Tools
+
+```go
+tools, err := client.ListTools(context.Background(), nil)
+if err != nil {
+    log.Fatalf("Failed to list tools: %v", err)
+}
+
+for _, tool := range tools.Tools {
+    log.Printf("Tool: %s. Description: %s", tool.Name, *tool.Description)
+}
+```
+
+### Calling a Tool
+
+```go
+// Define a type-safe struct for your tool arguments
+type CalculateArgs struct {
+    Operation string `json:"operation"`
+    A         int    `json:"a"`
+    B         int    `json:"b"`
+}
+
+// Create typed arguments
+args := CalculateArgs{
+    Operation: "add",
+    A:         10,
+    B:         5,
+}
+
+response, err := client.CallTool(context.Background(), "calculate", args)
+if err != nil {
+    log.Printf("Failed to call tool: %v", err)
+}
+
+// Handle the response
+if response != nil && len(response.Content) > 0 {
+    if response.Content[0].TextContent != nil {
+        log.Printf("Response: %s", response.Content[0].TextContent.Text)
+    }
+}
+```
+
+## Working with Prompts
+
+### Listing Available Prompts
+
+```go
+prompts, err := client.ListPrompts(context.Background(), nil)
+if err != nil {
+    log.Printf("Failed to list prompts: %v", err)
+}
+
+for _, prompt := range prompts.Prompts {
+    log.Printf("Prompt: %s. Description: %s", prompt.Name, *prompt.Description)
+}
+```
+
+### Using a Prompt
+
+```go
+// Define a type-safe struct for your prompt arguments
+type PromptArgs struct {
+    Input string `json:"input"`
+}
+
+// Create typed arguments
+args := PromptArgs{
+    Input: "Hello, MCP!",
+}
+
+response, err := client.GetPrompt(context.Background(), "prompt_name", args)
+if err != nil {
+    log.Printf("Failed to get prompt: %v", err)
+}
+
+if response != nil && len(response.Messages) > 0 {
+    log.Printf("Response: %s", response.Messages[0].Content.TextContent.Text)
+}
+```
+
+## Working with Resources
+
+### Listing Resources
+
+```go
+resources, err := client.ListResources(context.Background(), nil)
+if err != nil {
+    log.Printf("Failed to list resources: %v", err)
+}
+
+for _, resource := range resources.Resources {
+    log.Printf("Resource: %s", resource.Uri)
+}
+```
+
+### Reading a Resource
+
+```go
+resource, err := client.ReadResource(context.Background(), "resource_uri")
+if err != nil {
+    log.Printf("Failed to read resource: %v", err)
+}
+
+if resource != nil {
+    log.Printf("Resource content: %s", resource.Content)
+}
+```
+
+## Pagination
+
+Both `ListTools` and `ListPrompts` support pagination. You can pass a cursor to get the next page of results:
+
+```go
+var cursor *string
+for {
+    tools, err := client.ListTools(context.Background(), cursor)
+    if err != nil {
+        log.Fatalf("Failed to list tools: %v", err)
+    }
+
+    // Process tools...
+
+    if tools.NextCursor == nil {
+        break // No more pages
+    }
+    cursor = tools.NextCursor
+}
+```
+
+## Error Handling
+
+The client includes comprehensive error handling. All methods return an error as their second return value:
+
+```go
+response, err := client.CallTool(context.Background(), "calculate", args)
+if err != nil {
+    switch {
+    case errors.Is(err, mcp.ErrClientNotInitialized):
+        // Handle initialization error
+    default:
+        // Handle other errors
+    }
+}
+```
+
+## Best Practices
+
+1.  Always initialize the client before making any calls
+2.  Use appropriate context management for timeouts and cancellation
+3.  Handle errors appropriately for your use case
+4.  Close or clean up resources when done
+5.  Define type-safe structs for tool and prompt arguments
+6.  Use struct tags to ensure correct JSON field names
+
+## Complete Example
+
+For a complete working example, check out our [example client implementation](https://github.com/metoro-io/mcp-golang/tree/main/examples/client).
+
+## Transport Options
+
+The MCP client supports multiple transport options:
+
+### Standard I/O Transport
+
+For command-line tools that communicate through stdin/stdout:
+
+```go
+transport := stdio.NewStdioClientTransport()
+client := mcp.NewClient(transport)
+```
+
+This transport supports all MCP features including bidirectional communication and notifications.
+
+### HTTP Transport
+
+For web-based tools that communicate over HTTP/HTTPS:
+
+```go
+transport := http.NewHTTPClientTransport("/mcp")
+transport.WithBaseURL("http://localhost:8080")
+client := mcp.NewClient(transport)
+```
+
+Note that the HTTP transport is stateless and does not support bidirectional features like notifications. Each request-response cycle is independent, making it suitable for simple tool invocations but not for scenarios requiring real-time updates or persistent connections.
+
+## Context Support
+
+All client operations now support context propagation:
+
+```go
+ctx := context.Background()
+// With timeout
+ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+defer cancel()
+
+// Call tool with context
+response, err := client.CallTool(ctx, "tool-name", args)
+if err != nil {
+    // Handle error
+}
+
+// List tools with context
+tools, err := client.ListTools(ctx)
+if err != nil {
+    // Handle error
+}
+```
+
+The context allows you to:
+
+*   Set timeouts for operations
+*   Cancel long-running operations
+*   Pass request-scoped values
+*   Implement tracing and monitoring
+
+
+# Contributing
+
+Guidelines for contributing to the mcp-golang project
+
+## Development Guide
+
+This document provides a step-by-step guide for contributing to the mcp-golang project. By no means is it complete, but it should help you get started.
+
+### Development Setup
+
+To set up your development environment, follow these steps:
+
+#### Prerequisites
+
+*   Go 1.19 or higher
+*   Git
+
+#### Local Development
+
+1.  Clone the repository:
+
+```bash
+git clone https://github.com/metoro-io/mcp-golang.git
+cd mcp-golang
+```
+
+2.  Install dependencies:
+
+```bash
+go mod download
+```
+
+3.  Run tests:
+
+```bash
+go test ./...
+```
+
+### Project Structure
+
+The project is organized into several key packages:
+
+*   `server/`: Core server implementation
+*   `transport/`: Transport layer implementations (stdio, SSE)
+*   `protocol/`: MCP protocol implementation
+*   `examples/`: Example implementations
+*   `internal/`: Internal utilities and helpers
+
+### Implementation Guidelines
+
+#### Creating a Custom Transport
+
+To implement a custom transport, create a struct that implements the `Transport` interface.
+If your transport is not part of the spec then you can add it as an experimental feature.
+Before you implement the transport, you should have a good understanding of the MCP protocol. Take a look at [https://spec.modelcontextprotocol.io/specification/](https://spec.modelcontextprotocol.io/specification/)
+
+### Testing
+
+#### Unit Tests
+
+All new functions should have unit tests where possible. We currently use testify for this.
+Each test should explain its purpose and expected behavior. E.g.
+
+```go
+
+// TestProtocol_Request tests the core request-response functionality of the protocol.
+// This is the most important test as it covers the primary use case of the protocol.
+// It includes subtests for:
+// 1. Successful request/response with proper correlation
+// 2. Request timeout handling
+// 3. Request cancellation via context
+// These scenarios ensure the protocol can handle both successful and error cases
+// while maintaining proper message correlation and resource cleanup.
+func TestProtocol_Request(t *testing.T) {
+	p := NewProtocol(nil)
+	transport := mcp.newMockTransport()
+
+	if err := p.Connect(transport); err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+
+	// Test successful request
+	t.Run("Successful request", func(t *testing.T) {
+		ctx := context.Background()
+		go func() {
+			// Simulate response after a short delay
+			time.Sleep(10 * time.Millisecond)
+			msgs := transport.getMessages()
+			if len(msgs) == 0 {
+				t.Error("No messages sent")
+				return
+			}
+
+			lastMsg := msgs[len(msgs)-1]
+			req, ok := lastMsg.(map[string]interface{})
+			if !ok {
+				t.Error("Last message is not a request")
+				return
+			}
+
+			// Simulate response
+			transport.simulateMessage(map[string]interface{}{
+				"jsonrpc": "2.0",
+				"id":      req["id"],
+				"result":  "test result",
+			})
+		}()
+
+		result, err := p.Request(ctx, "test_method", map[string]string{"key": "value"}, nil)
+		if err != nil {
+			t.Fatalf("Request failed: %v", err)
+		}
+
+		if result != "test result" {
+			t.Errorf("Expected result 'test result', got %v", result)
+		}
+	})
+
+	// Test request timeout
+	t.Run("Request timeout", func(t *testing.T) {
+		ctx := context.Background()
+		opts := &RequestOptions{
+			Timeout: 50 * time.Millisecond,
+		}
+
+		_, err := p.Request(ctx, "test_method", nil, opts)
+		if err == nil {
+			t.Fatal("Expected timeout error, got nil")
+		}
+	})
+
+	// Test request cancellation
+	t.Run("Request cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			cancel()
+		}()
+
+		_, err := p.Request(ctx, "test_method", nil, nil)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Expected context.Canceled error, got %v", err)
+		}
+	})
+}
+}
+```
+
+#### Integration Tests
+
+Run integration tests that use the actual transport layers:
+
+```go
+func TestWithStdioTransport(t *testing.T) {
+    transport := stdio.NewStdioServerTransport()
+    server := server.NewServer(transport)
+    
+    // Test server with real transport
+}
+```
+
+### Contributing
+
+1.  Fork the repository
+2.  Create a feature branch
+3.  Make your changes
+4.  Add tests for new functionality
+5.  Run existing tests
+6.  Submit a pull request
+
+#### Pull Request Guidelines
+
+*   Keep changes focused and atomic
+*   Follow existing code style
+*   Include tests for new functionality
+*   Update documentation as needed
+*   Add yourself to CONTRIBUTORS.md
+
+## Adding docs
+
+<Info>
+  **Prerequisite**: Please install Node.js (version 19 or higher) before proceeding.
+</Info>
+
+Follow these steps to install and run Mintlify on your operating system:
+
+**Step 1**: Install Mintlify:
+
+<CodeGroup>
+  ```bash npm
+  npm i -g mintlify
+  ```
+
+  ```bash yarn
+  yarn global add mintlify
+  ```
+</CodeGroup>
+
+**Step 2**: Navigate to the docs directory (where the `mint.json` file is located) and execute the following command:
+
+```bash
+mintlify dev
+```
+
+A local preview of your documentation will be available at `http://localhost:3000`.
+
+When your PR merges into the main branch, it will be deployed automatically.
+
+## Getting Help
+
+*   Check existing [GitHub issues](https://github.com/metoro-io/mcp-golang/issues)
+*   Join our [Discord community](https://discord.gg/33saRwE3pT)
+*   Read the [Model Context Protocol specification](https://modelcontextprotocol.io/)
+
+
+# Introduction
+
+Welcome to mcp-golang  - A Go Implementation of the Model Context Protocol
+
+<img className="block dark:hidden" src="https://mintlify.s3.us-west-1.amazonaws.com/mcp-golang/logo/mcp-golang-light.svg" alt="MCP Golang Light Logo" />
+
+<img className="hidden dark:block" src="https://mintlify.s3.us-west-1.amazonaws.com/mcp-golang/logo/mcp-golang-dark.svg" alt="MCP Golang Dark Logo" />
+
+## What is mcp-golang?
+
+mcp-golang is an unofficial implementation of the [Model Context Protocol](https://modelcontextprotocol.io/) in Go. It provides a robust framework for building servers that can interact with AI models through a standardized protocol.
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Batteries Included" icon="battery-full">
+    Set up an MCP server with support for tools, resources, and prompts in just a few lines of code.
+  </Card>
+
+  <Card title="Type Safety" icon="shield-check">
+    Full Go type safety with automatic JSON schema generation from go structs.
+  </Card>
+
+  <Card title="Composable" icon="screwdriver-wrench">
+    Just take the components you need: transport, protocol or server.
+  </Card>
+
+  <Card title="Bring your own transport" icon="spinner">
+    mcp-golang has implemented the default transports: stdio and sse. If you need to implement your own transport, no problem! Use the rest of the library
+  </Card>
+</CardGroup>
+
+## Design Philosophy
+
+The library is designed with the following principles in mind:
+
+*   **Simple API**: Easy to use for basic cases while supporting complex production use cases
+*   **Sane Defaults**: Provides reasonable defaults while allowing customization
+*   **Server First**: Primary focus on server implementation with future plans for client support
+*   **Production Ready**: Built for reliability and performance in production environments
+
+## Getting Started
+
+To start using mcp-golang in your project, head over to our [Quickstart](/quickstart) guide. For more detailed information about development and contribution, check out our [Development](/development) guide.
+
+
+# null
+
+
+
+# Pagination
+
+MCP-Golang supports cursor-based pagination for listing tools, prompts, and resources. This allows clients to retrieve data in manageable chunks rather than all at once.
+
+By default, pagination is disabled, but you can enable it with the `WithPaginationLimit` option.
+
+<Warning>As of 2024-12-13, it looks like Claude does not support pagination yet.</Warning>
+
+## How Pagination Works
+
+If pagination is enabled, the server will limit the number of items returned in each response to the specified limit.
+
+1.  Limit the number of items returned to the specified limit
+2.  Include a `nextCursor` in the response if there are more items available
+3.  Accept a `cursor` parameter in subsequent requests to get the next page
+
+## Enabling Pagination
+
+Pagination is enabled by default with a limit of 2 items per page. You can modify this behavior when creating a new server:
+
+```go
+server := mcp_golang.NewServer(
+    mcp_golang.WithPaginationLimit(5), // Set items per page to 5
+)
+```
+
+To disable pagination entirely, set the pagination limit to nil:
+
+```go
+server := mcp_golang.NewServer(
+    mcp_golang.WithPaginationLimit(nil), // Disable pagination
+)
+```
+
+## Important Notes
+
+1.  The cursor is opaque and should be treated as a black box by clients
+2.  Cursors are valid only for the specific list operation they were generated for
+3.  As of 2024-12-13, Claude does not support pagination yet
+4.  The pagination limit applies to all list operations (tools, prompts, and resources)
+
+
+# Quickstart
+
+Set up your first mcp-golang server
+
+## Installation
+
+First, add mcp-golang to your project:
+
+```bash
+go get github.com/metoro-io/mcp-golang
+```
+
+## Basic Usage
+
+Here's a simple example of creating an MCP server with a basic tool, a prompt and two resources.
+
+```go
+package main
+
+import (
+	"fmt"
+	"github.com/metoro-io/mcp-golang"
+	"github.com/metoro-io/mcp-golang/transport/stdio"
+)
+
+type Content struct {
+	Title       string  `json:"title" jsonschema:"required,description=The title to submit"`
+	Description *string `json:"description" jsonschema:"description=The description to submit"`
+}
+type MyFunctionsArguments struct {
+	Submitter string  `json:"submitter" jsonschema:"required,description=The name of the thing calling this tool (openai, google, claude, etc)"`
+	Content   Content `json:"content" jsonschema:"required,description=The content of the message"`
+}
+
+func main() {
+	done := make(chan struct{})
+
+	server := mcp_golang.NewServer(stdio.NewStdioServerTransport())
+	err := server.RegisterTool("hello", "Say hello to a person", func(arguments MyFunctionsArguments) (*mcp_golang.ToolResponse, error) {
+		return mcp_golang.NewToolResponse(mcp_golang.NewTextContent(fmt.Sprintf("Hello, %server!", arguments.Submitter))), nil
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	err = server.RegisterPrompt("prompt_test", "This is a test prompt", func(arguments Content) (*mcp_golang.PromptResponse, error) {
+		return mcp_golang.NewPromptResponse("description", mcp_golang.NewPromptMessage(mcp_golang.NewTextContent(fmt.Sprintf("Hello, %server!", arguments.Title)), mcp_golang.RoleUser)), nil
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	err = server.RegisterResource("test://resource", "resource_test", "This is a test resource", "application/json", func() (*mcp_golang.ResourceResponse, error) {
+		return mcp_golang.NewResourceResponse(mcp_golang.NewTextEmbeddedResource("test://resource", "This is a test resource", "application/json")), nil
+	})
+
+	err = server.RegisterResource("file://app_logs", "app_logs", "The app logs", "text/plain", func() (*mcp_golang.ResourceResponse, error) {
+		return mcp_golang.NewResourceResponse(mcp_golang.NewTextEmbeddedResource("file://app_logs", "This is a test resource", "text/plain")), nil
+	})
+
+	err = server.Serve()
+	if err != nil {
+		panic(err)
+	}
+
+	<-done
+}
+```
+
+### Using with Claude
+
+Create a file in \~/Library/Application Support/Claude/claude\_desktop\_config.json with the following contents:
+
+```json
+{
+"mcpServers": {
+  "golang-mcp-server": {
+      "command": "<your path to golang MCP server go executable>",
+      "args": [],
+      "env": {}
+    }
+  }
+}
+```
+
+## HTTP Server Example
+
+You can also create an HTTP-based MCP server. Note that HTTP transport is stateless and doesn't support bidirectional features like notifications - use stdio transport if you need those features.
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "github.com/metoro-io/mcp-golang"
+    "github.com/metoro-io/mcp-golang/transport/http"
+)
+
+func main() {
+    // Create an HTTP transport
+    transport := http.NewHTTPTransport("/mcp")
+    transport.WithAddr(":8080")
+
+    // Create server with the HTTP transport
+    server := mcp.NewServer(transport)
+
+    // Register your tools
+    server.RegisterTool("hello", &HelloTool{})
+
+    // Start the server
+    if err := server.Serve(); err != nil {
+        log.Fatal(err)
+    }
+}
+```
+
+Or using the Gin framework:
+
+```go
+package main
+
+import (
+    "github.com/gin-gonic/gin"
+    "github.com/metoro-io/mcp-golang"
+    "github.com/metoro-io/mcp-golang/transport/http"
+)
+
+func main() {
+    // Create a Gin transport
+    transport := http.NewGinTransport()
+    
+    // Create server with the Gin transport
+    server := mcp.NewServer(transport)
+
+    // Register your tools
+    server.RegisterTool("hello", &HelloTool{})
+
+    // Set up Gin router
+    router := gin.Default()
+    router.POST("/mcp", transport.Handler())
+    
+    // Start the server
+    router.Run(":8080")
+}
+```
+
+## HTTP Client Example
+
+To connect to an HTTP-based MCP server:
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "github.com/metoro-io/mcp-golang"
+    "github.com/metoro-io/mcp-golang/transport/http"
+)
+
+func main() {
+    // Create an HTTP client transport
+    transport := http.NewHTTPClientTransport("/mcp")
+    transport.WithBaseURL("http://localhost:8080")
+
+    // Create client with the HTTP transport
+    client := mcp.NewClient(transport)
+
+    // Use the client with context
+    ctx := context.Background()
+    response, err := client.CallTool(ctx, "hello", map[string]interface{}{
+        "name": "World",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    log.Printf("Response: %v", response)
+}
+```
+
+## Next Steps
+
+*   If you're interested in contributing to mcp-golang, check out [Development Guide](/development) for more detailed information
+*   Join our [Discord Community](https://discord.gg/33saRwE3pT) for support
+*   Visit our [GitHub Repository](https://github.com/metoro-io/mcp-golang) to contribute
+
+
+# Tools
+
+Using tools in mcp-golang
+
+## What is a tool?
+
+A tool as defined in the MCP protocol is:
+
+> The Model Context Protocol (MCP) allows servers to expose tools that can be invoked by language models. Tools enable models to interact with external systems, such as querying databases, calling APIs, or performing computations. Each tool is uniquely identified by a name and includes metadata describing its schema.
+
+In MCP golang, you can register a tool with the MCP server using the `RegisterTool` function. This function takes a name, a description, and a handler that will be called when the tool is called by a client.
+
+Here's an example of spinning up a server that has a single tool:
+
+```go
+package main
+
+import (
+	"fmt"
+	"github.com/metoro-io/mcp-golang"
+	"github.com/metoro-io/mcp-golang/transport/stdio"
+)
+
+type HelloArguments struct {
+	Submitter string `json:"submitter" jsonschema:"required,description=The name of the thing calling this tool (openai or google or claude etc)'"`
+}
+
+func main() {
+	done := make(chan struct{})
+	server := mcp_golang.NewServer(stdio.NewStdioServerTransport())
+	err := server.RegisterTool("hello", "Say hello to a person", func(arguments HelloArguments) (*mcp_golang.ToolResponse, error) {
+		return mcp_golang.NewToolResponse(mcp_golang.NewTextContent(fmt.Sprintf("Hello, %s!", arguments.Submitter))), nil
+	})
+	err = server.Serve()
+	if err != nil {
+		panic(err)
+	}
+	<-done
+}
+
+```
+
+There are a few things going on in the tool registration that are worth mentioning:
+
+1.  The `RegisterTool` function takes a name, a description, and a handler that will be called when the tool is called by a client. The information you pass to the `RegisterTool` function is used to generate the tool schema.
+    When a client calls a tool, the server will send the arguments to the handler function.
+2.  The arguments of the handler function must be a single struct. That struct can be anything you like, golang-mcp will take care of serializing and deserializing the arguments to and from JSON.
+    The struct you use should have valid json and jsonschema tags. These will also be used to populate the tool schema.
+3.  The return values of the handler must be a `*mcp_golang.ToolResponse` and an `error`. If you pass back an error, mcp-golang will take care of serializing it and passing it back to the client.
+
+### Schema Generation
+
+One of the main features of mcp-golang is the ability to automatically generate the schema for tools. This is done by inspecting the arguments and return values of the handler function.
+You don't have to worry about maintaining a schema manually. Just make sure your input struct is up to date and mcp-golang will take care of the rest.
+
+For the example above, this is what the mcp-protocol messages will look like
+
+```json
+client: {"method":"tools/list","params":{},"jsonrpc":"2.0","id":2}
+server: {"id":2,"jsonrpc":"2.0","result":{"tools":[{"description":"Say hello to a person","inputSchema":{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"submitter":{"type":"string","description":"The name of the thing calling this tool (openai or google or claude etc)'"}},"type":"object","required":["submitter"]},"name":"hello"}]}}
+```
+
+Using this function in claude, looks like this:
+
+<img src="https://mintlify.s3.us-west-1.amazonaws.com/mcp-golang/images/tools-example-usage.png" alt="Simple Tool usage mcp-golang in claude" />
+
+The underlying rpc messages for the call itself look like this:
+
+```json
+client: {"method":"tools/call","params":{"name":"hello","arguments":{"submitter":"claude"}},"jsonrpc":"2.0","id":10}
+server: {"id":10,"jsonrpc":"2.0","result":{"content":[{"text":"Hello, claude!","type":"text"}],"isError":false}}
+```
+
+### Tool Arguments
+
+*   **Required fields** If you need the client to always provide this argument, use the `jsonschema:"required"` tag.
+*   **Optional fields** All fields are optional by default. Just don't use the `jsonschema:"required"` tag.
+*   **Description** Use the `jsonschema:"description"` tag to add a description to the argument.
+
+## HTTP Transport
+
+The MCP SDK now supports HTTP transport for both client and server implementations. This allows you to build MCP tools that communicate over HTTP/HTTPS endpoints.
+
+**Note:** The HTTP transport implementations are stateless, which means they don't support bidirectional communication features like notifications. If you need to send notifications or maintain a persistent connection between client and server, use the stdio transport instead.
+
+### HTTP Server
+
+There are two server implementations available:
+
+1.  Standard HTTP Server:
+
+```go
+transport := http.NewHTTPTransport("/mcp")
+transport.WithAddr(":8080") // Optional, defaults to :8080
+```
+
+2.  Gin Framework Server:
+
+```go
+transport := http.NewGinTransport()
+router := gin.Default()
+router.POST("/mcp", transport.Handler())
+```
+
+### HTTP Client
+
+The HTTP client transport allows you to connect to MCP servers over HTTP:
+
+```go
+transport := http.NewHTTPClientTransport("/mcp")
+transport.WithBaseURL("http://localhost:8080")
+```
+
+### Context Support
+
+All transport implementations now support context propagation. This allows you to pass request-scoped data and handle timeouts/cancellation:
+
+```go
+transport.SetMessageHandler(func(ctx context.Context, msg *transport.BaseJsonRpcMessage) {
+    // Access context values or handle cancellation
+    if deadline, ok := ctx.Deadline(); ok {
+        // Handle deadline
+    }
+    // Process message
+})
+```
+
+The context is propagated through all MCP operations, making it easier to implement timeouts, tracing, and other cross-cutting concerns.
+
